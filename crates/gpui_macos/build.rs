@@ -98,9 +98,11 @@ mod macos_build {
         output_path
     }
 
-    /// Locate the gpui crate directory relative to this crate.
+    /// Cargo passes source metadata from the regular GPUI dependency.
     fn find_gpui_crate_dir() -> PathBuf {
-        gpui::GPUI_MANIFEST_DIR.into()
+        env::var_os("DEP_GPUI_MANIFEST_DIR")
+            .expect("GPUI must advertise its source directory to generate shader bindings")
+            .into()
     }
 
     /// To enable runtime compilation, we need to "stitch" the shaders file with the generated header
