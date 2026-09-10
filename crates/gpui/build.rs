@@ -2,6 +2,11 @@
 
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(gles)");
+    println!("cargo::rerun-if-changed=build.rs");
+    println!(
+        "cargo::metadata=manifest_dir={}",
+        std::env::var("CARGO_MANIFEST_DIR").expect("Cargo must provide GPUI's source directory")
+    );
 
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
