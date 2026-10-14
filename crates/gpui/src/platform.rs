@@ -863,7 +863,7 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn draw(&self, scene: &Scene);
 
     /// Paint deferred content above native child surfaces when supported.
-    fn draw_layered(&self, scene: &Scene, _overlay_start: usize, _capture_input: bool) {
+    fn draw_layered(&self, scene: &Scene, _overlay_start: usize, _input: &[Bounds<Pixels>]) {
         self.draw(scene);
     }
 
