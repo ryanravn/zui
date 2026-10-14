@@ -114,10 +114,23 @@ const NSDragOperationNone: NSDragOperation = 0;
 const NSDragOperationCopy: NSDragOperation = 1;
 // This class uses the same window-state ownership as GPUIView. It does not
 // become a first responder; interactive overlay events go through GPUIView.
-extern "C" fn overlay_hit_test(this: &Object, _: Sel, _: NSPoint) -> id {
-    let active =
-        unsafe { &*(*this.get_ivar::<*const c_void>(OVERLAY_INPUT_IVAR) as *const AtomicBool) };
-    if active.load(Ordering::Acquire) {
+// It claims a point only inside a region something on the plane takes input in,
+// so the webview under the rest of the window keeps its scrolling and clicks.
+extern "C" fn overlay_hit_test(this: &Object, _: Sel, location: NSPoint) -> id {
+    let input = unsafe {
+        &*(*this.get_ivar::<*const c_void>(OVERLAY_INPUT_IVAR) as *const Mutex<Vec<Bounds<Pixels>>>)
+    };
+    let regions = input.lock();
+    if regions.is_empty() {
+        return nil;
+    }
+    // AppKit passes the point in the superview's coordinates. This view fills
+    // that unflipped superview, so only y differs from GPUI's top-left points.
+    let height = unsafe { NSView::bounds(this as *const Object as id) }
+        .size
+        .height;
+    let at = point(px(location.x as f32), px((height - location.y) as f32));
+    if regions.iter().any(|region| region.contains(&at)) {
         this as *const Object as id
     } else {
         nil
@@ -586,7 +599,7 @@ struct MacWindowState {
     overlay_renderer: Option<renderer::Renderer>,
     overlay_view: Option<NonNull<Object>>,
     overlay_backdrops: Vec<(NonNull<Object>, f32)>,
-    overlay_capture_input: Arc<AtomicBool>,
+    overlay_input: Arc<Mutex<Vec<Bounds<Pixels>>>>,
     overlay_size: Option<(Size<Pixels>, f32)>,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     event_callback: Option<Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>>,
@@ -1005,7 +1018,7 @@ impl MacWindow {
                 overlay_renderer: None,
                 overlay_view: None,
                 overlay_backdrops: Vec::new(),
-                overlay_capture_input: Arc::new(AtomicBool::new(false)),
+                overlay_input: Arc::new(Mutex::new(Vec::new())),
                 overlay_size: None,
                 request_frame_callback: None,
                 event_callback: None,
@@ -1941,7 +1954,7 @@ impl PlatformWindow for MacWindow {
         this.renderer.draw(scene);
     }
 
-    fn draw_layered(&self, scene: &gpui::Scene, overlay_start: usize, capture_input: bool) {
+    fn draw_layered(&self, scene: &gpui::Scene, overlay_start: usize, input: &[Bounds<Pixels>]) {
         let mut state = self.0.lock();
         if state.overlay_renderer.is_none() {
             state.renderer.draw(scene);
@@ -1955,10 +1968,19 @@ impl PlatformWindow for MacWindow {
         overlay.replay(split..scene.len(), scene);
         overlay.finish();
         let visible = !overlay.is_empty();
-        let active = capture_input && visible;
-        let was_active = state.overlay_capture_input.swap(active, Ordering::AcqRel);
-        let focus_chrome = active && !was_active;
         let size = state.content_size();
+        let input = if visible { input } else { &[] };
+        // Keys move to GPUI only for what covers the whole window, a prompt or a
+        // modal; a toast or a menu beside a page leaves typing in the page.
+        let whole = Bounds::new(Point::default(), size);
+        let covers = |regions: &[Bounds<Pixels>]| {
+            regions
+                .iter()
+                .any(|region| region.intersect(&whole) == whole)
+        };
+        let was_covering = covers(&state.overlay_input.lock());
+        let focus_chrome = covers(input) && !was_covering;
+        *state.overlay_input.lock() = input.to_vec();
         let scale = state.scale_factor();
         if state.overlay_size != Some((size, scale)) {
             let renderer = state.overlay_renderer.as_mut().unwrap();
@@ -2077,7 +2099,7 @@ impl PlatformWindow for MacWindow {
             );
             (*view).set_ivar(
                 OVERLAY_INPUT_IVAR,
-                Arc::into_raw(state.overlay_capture_input.clone()) as *const c_void,
+                Arc::into_raw(state.overlay_input.clone()) as *const c_void,
             );
             let mut renderer = state.renderer.new_overlay();
             let size = state.content_size();
@@ -2320,8 +2342,9 @@ extern "C" fn dealloc_window(this: &Object, _: Sel) {
 
 extern "C" fn dealloc_overlay_view(this: &Object, _: Sel) {
     unsafe {
-        let active = *this.get_ivar::<*const c_void>(OVERLAY_INPUT_IVAR) as *const AtomicBool;
-        drop(Arc::from_raw(active));
+        let input = *this.get_ivar::<*const c_void>(OVERLAY_INPUT_IVAR)
+            as *const Mutex<Vec<Bounds<Pixels>>>;
+        drop(Arc::from_raw(input));
         drop_window_state(this);
         let _: () = msg_send![super(this, class!(NSView)), dealloc];
     }
