@@ -986,7 +986,7 @@ impl PlatformWindow for WindowsWindow {
             .log_err();
     }
 
-    fn draw_layered(&self, scene: &Scene, overlay_start: usize, capture_input: bool) {
+    fn draw_layered(&self, scene: &Scene, overlay_start: usize, input: &[Bounds<Pixels>]) {
         let mut renderer = self.state.renderer.borrow_mut();
         if !renderer.has_overlay() {
             renderer
@@ -1000,7 +1000,7 @@ impl PlatformWindow for WindowsWindow {
         drop(renderer);
         // A menu opening over a focused native child takes the keyboard, as
         // the macOS overlay does; passive tooltips leave it alone.
-        let active = capture_input && overlay_start < scene.len();
+        let active = !input.is_empty() && overlay_start < scene.len();
         if active && !self.state.overlay_capture_input.replace(active) {
             reclaim_focus_from_native_child(self.0.hwnd);
         } else if !active {
