@@ -63,6 +63,7 @@ pub struct WindowsWindowState {
     pub direct_manipulation: DirectManipulationHandler,
 
     pub renderer: RefCell<DirectXRenderer>,
+    pub(crate) native_children: RefCell<NativeChildInput>,
     /// Set after a GPU device-lost recovery so the next `draw_window` call is
     /// treated as a forced render. This guarantees the next frame both
     /// re-enables drawing (via `mark_drawable`) and bypasses the GPUI view
@@ -168,6 +169,7 @@ impl WindowsWindowState {
             last_reported_capslock: Cell::new(last_reported_capslock),
             hovered: Cell::new(hovered),
             renderer: RefCell::new(renderer),
+            native_children: RefCell::new(NativeChildInput::default()),
             force_render_after_recovery: Cell::new(false),
             click_state,
             current_cursor: Cell::new(current_cursor),
@@ -982,6 +984,52 @@ impl PlatformWindow for WindowsWindow {
             .log_err();
     }
 
+    fn draw_layered(&self, scene: &Scene, overlay_start: usize, input: &[Bounds<Pixels>]) {
+        let mut renderer = self.state.renderer.borrow_mut();
+        if !renderer.has_overlay() {
+            renderer
+                .draw(scene, self.state.background_appearance.get())
+                .log_err();
+            return;
+        }
+        renderer
+            .draw_layered(scene, overlay_start, self.state.background_appearance.get())
+            .log_err();
+        drop(renderer);
+        let input = if overlay_start < scene.len() {
+            input
+        } else {
+            &[]
+        };
+        let scale_factor = self.state.scale_factor.get();
+        let regions: Vec<RECT> = input
+            .iter()
+            .map(|bounds| RECT {
+                left: (bounds.origin.x.as_f32() * scale_factor).floor() as i32,
+                top: (bounds.origin.y.as_f32() * scale_factor).floor() as i32,
+                right: ((bounds.origin.x + bounds.size.width).as_f32() * scale_factor).ceil()
+                    as i32,
+                bottom: ((bounds.origin.y + bounds.size.height).as_f32() * scale_factor).ceil()
+                    as i32,
+            })
+            .collect();
+        let mut client = RECT::default();
+        unsafe { GetClientRect(self.0.hwnd, &mut client) }.log_err();
+        // Keys move to GPUI only for what covers the whole window, a prompt or a drag; a toast or
+        // a menu beside a page leaves typing in the page, as on macOS.
+        let covers = regions.iter().any(|region| contains(region, &client));
+        let mut children = self.state.native_children.borrow_mut();
+        if covers && !children.covered {
+            reclaim_focus_from_native_child(self.0.hwnd);
+        }
+        children.covered = covers;
+        children.update(self.0.hwnd, &regions);
+    }
+
+    fn enable_scene_overlay(&self) -> anyhow::Result<()> {
+        self.state.renderer.borrow_mut().enable_overlay()
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.state.renderer.borrow().sprite_atlas()
     }
@@ -1604,6 +1652,112 @@ fn set_non_rude_hwnd(hwnd: HWND, non_rude: bool) {
         unsafe { SetPropW(hwnd, w!("NonRudeHWND"), Some(HANDLE(1 as _))) }.log_err();
     } else {
         unsafe { RemovePropW(hwnd, w!("NonRudeHWND")) }.log_err();
+    }
+}
+
+/// A native child window takes the pointer wherever it is, whatever the overlay draws above it,
+/// so the overlay's input regions are taken out of each child: where a region covers part of a
+/// child it is cut from the child's window region, and a child a region covers whole is disabled
+/// instead, because a region clips drawing too and would blank the page under a prompt. Either
+/// way the press reaches this window and the menu or prompt drawn there.
+#[derive(Default)]
+pub(crate) struct NativeChildInput {
+    /// The holes this cut, by child, in the child's own coordinates.
+    cut: Vec<(HWND, Vec<RECT>)>,
+    disabled: Vec<HWND>,
+    /// Whether an input region covered the whole window last frame.
+    covered: bool,
+}
+
+impl NativeChildInput {
+    fn update(&mut self, parent: HWND, regions: &[RECT]) {
+        if regions.is_empty() && self.cut.is_empty() && self.disabled.is_empty() {
+            return;
+        }
+        let mut origin = POINT::default();
+        let _ = unsafe { ClientToScreen(parent, &mut origin) };
+        let mut cut = Vec::new();
+        let mut disabled = Vec::new();
+        let mut next = unsafe { GetWindow(parent, GW_CHILD) }.ok();
+        while let Some(child) = next {
+            next = unsafe { GetWindow(child, GW_HWNDNEXT) }.ok();
+            let mut frame = RECT::default();
+            if unsafe { GetWindowRect(child, &mut frame) }.is_err() {
+                continue;
+            }
+            let (x, y) = (frame.left - origin.x, frame.top - origin.y);
+            let whole = RECT {
+                left: 0,
+                top: 0,
+                right: frame.right - frame.left,
+                bottom: frame.bottom - frame.top,
+            };
+            let mut holes: Vec<RECT> = regions
+                .iter()
+                .map(|region| RECT {
+                    left: (region.left - x).max(0),
+                    top: (region.top - y).max(0),
+                    right: (region.right - x).min(whole.right),
+                    bottom: (region.bottom - y).min(whole.bottom),
+                })
+                .filter(|hole| hole.left < hole.right && hole.top < hole.bottom)
+                .collect();
+            let covered = holes.iter().any(|hole| contains(hole, &whole));
+            if covered {
+                holes.clear();
+                disabled.push(child);
+            }
+            if covered != self.disabled.contains(&child) {
+                let _ = unsafe { EnableWindow(child, !covered) };
+            }
+            let before = self
+                .cut
+                .iter()
+                .find(|(window, _)| *window == child)
+                .map_or(&[][..], |(_, holes)| holes.as_slice());
+            if before != holes.as_slice() {
+                set_holes(child, &whole, &holes);
+            }
+            if !holes.is_empty() {
+                cut.push((child, holes));
+            }
+        }
+        self.cut = cut;
+        self.disabled = disabled;
+    }
+}
+
+fn set_holes(child: HWND, whole: &RECT, holes: &[RECT]) {
+    unsafe {
+        if holes.is_empty() {
+            SetWindowRgn(child, None, true);
+            return;
+        }
+        let region = CreateRectRgn(whole.left, whole.top, whole.right, whole.bottom);
+        for hole in holes {
+            let cut = CreateRectRgn(hole.left, hole.top, hole.right, hole.bottom);
+            CombineRgn(Some(region), Some(region), Some(cut), RGN_DIFF);
+            let _ = DeleteObject(cut.into());
+        }
+        // The system owns the region from here, and frees it.
+        SetWindowRgn(child, Some(region), true);
+    }
+}
+
+fn contains(outer: &RECT, inner: &RECT) -> bool {
+    outer.left <= inner.left
+        && outer.top <= inner.top
+        && outer.right >= inner.right
+        && outer.bottom >= inner.bottom
+}
+
+/// Move keyboard focus back to this window when one of its native children holds it.
+pub(crate) fn reclaim_focus_from_native_child(hwnd: HWND) {
+    unsafe {
+        let focus = GetFocus();
+        if !focus.is_invalid() && focus != hwnd && IsChild(hwnd, focus).as_bool() {
+            let _ = SetFocus(Some(hwnd));
+        }
     }
 }
 

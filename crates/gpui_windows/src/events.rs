@@ -421,6 +421,9 @@ impl WindowsWindowInner {
         lparam: LPARAM,
     ) -> Option<isize> {
         unsafe { SetCapture(handle) };
+        // A press on GPUI content takes the keyboard from a native child: a child window keeps
+        // the focus when its parent is clicked.
+        reclaim_focus_from_native_child(handle);
 
         let Some(mut func) = self.state.callbacks.input.take() else {
             return Some(1);
