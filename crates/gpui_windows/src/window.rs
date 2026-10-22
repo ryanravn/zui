@@ -896,6 +896,22 @@ impl PlatformWindow for WindowsWindow {
         unsafe { ShowWindowAsync(self.0.hwnd, SW_MINIMIZE).ok().log_err() };
     }
 
+    // The move loop pumps messages, and a task one of them runs would update the app this is
+    // called from inside an input handler of. Posted, it starts once the handler has returned,
+    // with the button still down, and moves and snaps as a caption drag does.
+    fn start_window_move(&self) {
+        unsafe {
+            ReleaseCapture().log_err();
+            PostMessageW(
+                Some(self.0.hwnd),
+                WM_SYSCOMMAND,
+                WPARAM((SC_MOVE | HTCAPTION) as usize),
+                LPARAM::default(),
+            )
+            .log_err();
+        }
+    }
+
     fn zoom(&self) {
         unsafe {
             if IsWindowVisible(self.0.hwnd).as_bool() {
